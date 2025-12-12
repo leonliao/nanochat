@@ -52,12 +52,40 @@ y2 = x1 * (-sin) + x2 * cos
 This rotates the vector in high-dimensional space. The angle of rotation ($\theta$) depends on the token's position in the sequence, which allows the model to understand relative distances between tokens (e.g., "word A is 5 words before word B").
 torch.cat([y1, y2], 3): It stitches the two rotated halves back together to form the final query or key vector.
 Why do this? This allows the attention mechanism to naturally understand relative positions (how far apart tokens are) rather than just absolute positions (index 5 vs index 100), which generally leads to better performance on long sequences.
+
+
+x1 (5, 10, 32, 32)
+cos (1, 10, 1, 32)
+
+
+3. ✨ 具体乘法过程（张量复制）
+由于所有维度都兼容，乘法可以执行。在内部，广播机制实际上是“假想地”扩展了维度大小为 1 的张量，使其形状匹配另一个张量。
+1.	维度 0 cos 的大小是 1，它会被复制 5 次以匹配 x1 的大小 5。
+2.	维度 2 cos 的大小是 1，它会被复制 32 次以匹配 x1 的大小 32。
+o	重要提示：在张量 cos 中，维度 2 的大小是 1，这意味着整个 (1, 32) 的行向量（或说 1 x 32 的切片）会被复制 32 次。
+最终，在执行元素级乘法之前，两个张量的概念形状都变为 (5, 10, 32, 32)：
+•	x1：形状 (5, 10, 32, 32)
+•	cos 广播后：形状 (5, 10, 32, 32)
+乘法操作 x1 * cos 会对这两个形状相同的张量的所有对应元素进行乘积运算，得到一个最终形状为 (5, 10, 32, 32) 的结果张量。
+Leon: 也就是10个seq_len的32个head里面，64个dim一半乘于cos，一半乘于sin
+而cos/sin值随着head_dim变化而变化
+总结
+这是一个成功的广播操作，最终结果张量的形状是两个张量中不为 1 的维度的组合，即 (5, 10, 32, 32)。
+https://gemini.google.com/app/54169d29bc66ce1e
+
+
 """
 def apply_rotary_emb(x, cos, sin):
     assert x.ndim == 4  # multihead attention
     #x(B, T, self.n_head, self.head_dim)
     d = x.shape[3] // 2
     x1, x2 = x[..., :d], x[..., d:] # split up last time into two halves
+    #cos/sin每行的值是0, 1, 2, ... seq_len - 1根据在toekn串中的位置不同而不同
+    # x1的维度是(B, T, self.n_head, self.head_dim // 2)
+    # cos的维度是(1, T, 1, self.head_dim // 2)
+    # x1 * cos可以先从第4维开始，将cos的第四维度数组广播到x1的第四维度数组对应位置相乘，也就是同一个位置的所有head的head_dim // 2的元素乘于同一个cos/sin值
+    # 然后在第2维，用T的序号对应的cos/sin值，保证同一个位置的所有head的head_dim // 2的元素乘于同一个cos/sin值
+
     y1 = x1 * cos + x2 * sin # rotate pairs of dims
     y2 = x1 * (-sin) + x2 * cos
     out = torch.cat([y1, y2], 3) # re-assemble 在第4维上拼接，拼接回head_dim
@@ -334,14 +362,17 @@ Stability: Unlike standard float16, bfloat16 preserves the dynamic range of floa
         if device is None:
             device = self.transformer.wte.weight.device
         # stride the channels
-        channel_range = torch.arange(0, head_dim, 2, dtype=torch.float32, device=device)
-        inv_freq = 1.0 / (base ** (channel_range / head_dim))
+        channel_range = torch.arange(0, head_dim, 2, dtype=torch.float32, device=device) # 0, 2, 4, ...从0开始到head_dim(不包括)，步长2
+        inv_freq = 1.0 / (base ** (channel_range / head_dim)) # 其实是base^[(-1) * (channel_range / head_dim)], 也就是 base^(-x)函数的取样值
         # stride the time steps
-        t = torch.arange(seq_len, dtype=torch.float32, device=device)
+        t = torch.arange(seq_len, dtype=torch.float32, device=device) # 生成0, 1, 2, ... seq_len - 1
         # calculate the rotation frequencies at each (time, channel) pair
-        freqs = torch.outer(t, inv_freq)
-        cos, sin = freqs.cos(), freqs.sin()
+        # 笛卡尔积, 生成seq_len * (head_dim/2)的矩阵。每行的值是0, 1, 2, ... seq_len - 1 逐个数字乘于 inv_freq生成的多行矩阵
+        # 那就是每行的值根据在toekn串中的位置不同而不同
+        freqs = torch.outer(t, inv_freq) 
+        cos, sin = freqs.cos(), freqs.sin() # 生成seq_len * (head_dim/2)的两个cos/sin矩阵
         cos, sin = cos.bfloat16(), sin.bfloat16() # keep them in bfloat16
+        # cos,sin 是 1(batch), seq_len, 1(head), head_dim/2
         cos, sin = cos[None, :, None, :], sin[None, :, None, :] # add batch and head dims for later broadcasting
         return cos, sin
 
